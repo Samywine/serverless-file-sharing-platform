@@ -22,6 +22,15 @@ query GetDownloadUrl($s3Key: String!) {
 }
 `;
 
+const deleteFileCascadeMutation = `
+mutation DeleteFileCascade($fileId: ID!, $s3Key: String!) {
+  deleteFileCascade(fileId: $fileId, s3Key: $s3Key) {
+    uploadURL
+    key
+  }
+}
+`;
+
 const createFileMutation = `
 mutation CreateFile(
   $fileId: ID!,
@@ -120,6 +129,12 @@ function MainApp() {
   const [files, setFiles] = useState([]);
   const [comments, setComments] = useState({});
   const [commentInputs, setCommentInputs] = useState({});
+  const [statusMessage, setStatusMessage] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [downloadingKey, setDownloadingKey] = useState('');
+  const [deletingFileId, setDeletingFileId] = useState('');
+  const [loadingCommentsFileId, setLoadingCommentsFileId] = useState('');
+  const [addingCommentFileId, setAddingCommentFileId] = useState('');
 
   useEffect(() => {
     loadCurrentUser();
@@ -152,15 +167,19 @@ function MainApp() {
       setFiles(result?.data?.listFiles || []);
     } catch (error) {
       console.error('Error loading files:', error);
+      setStatusMessage('Could not load files.');
     }
   };
 
   const uploadFile = async () => {
     try {
       if (!selectedFile || !user) {
-        alert('Please choose a file first');
+        setStatusMessage('Please choose a file first.');
         return;
       }
+
+      setUploading(true);
+      setStatusMessage('Uploading file...');
 
       const uploadResult = await client.graphql({
         query: getUploadUrlMutation,
@@ -200,17 +219,22 @@ function MainApp() {
         authMode: 'userPool'
       });
 
-      alert('File uploaded successfully');
       setSelectedFile(null);
-      loadFiles();
+      setStatusMessage('File uploaded successfully.');
+      await loadFiles();
     } catch (error) {
       console.error('Upload error:', error);
-      alert('Upload failed. Check browser console.');
+      setStatusMessage('Upload failed. Check browser console.');
+    } finally {
+      setUploading(false);
     }
   };
 
   const downloadFile = async (s3Key) => {
     try {
+      setDownloadingKey(s3Key);
+      setStatusMessage('Preparing download...');
+
       const result = await client.graphql({
         query: getDownloadUrlQuery,
         variables: { s3Key },
@@ -224,14 +248,56 @@ function MainApp() {
       }
 
       window.open(downloadURL, '_blank');
+      setStatusMessage('Download started.');
     } catch (error) {
       console.error('Error downloading file:', error);
-      alert('Download failed. Check browser console.');
+      setStatusMessage('Download failed. Check browser console.');
+    } finally {
+      setDownloadingKey('');
+    }
+  };
+
+  const deleteFile = async (fileId, s3Key, fileName) => {
+    try {
+      const confirmed = window.confirm(`Delete "${fileName}" and all related comments/shares?`);
+      if (!confirmed) return;
+
+      setDeletingFileId(fileId);
+      setStatusMessage('Deleting file and related data...');
+
+      await client.graphql({
+        query: deleteFileCascadeMutation,
+        variables: { fileId, s3Key },
+        authMode: 'userPool'
+      });
+
+      setComments((prev) => {
+        const updated = { ...prev };
+        delete updated[fileId];
+        return updated;
+      });
+
+      setCommentInputs((prev) => {
+        const updated = { ...prev };
+        delete updated[fileId];
+        return updated;
+      });
+
+      setStatusMessage('File and related data deleted successfully.');
+      await loadFiles();
+    } catch (error) {
+      console.error('Error deleting file:', error);
+      setStatusMessage('Delete failed. Check browser console.');
+    } finally {
+      setDeletingFileId('');
     }
   };
 
   const loadComments = async (fileId) => {
     try {
+      setLoadingCommentsFileId(fileId);
+      setStatusMessage('Loading comments...');
+
       const result = await client.graphql({
         query: getCommentsByFileQuery,
         variables: { fileId },
@@ -242,15 +308,26 @@ function MainApp() {
         ...prev,
         [fileId]: result?.data?.getCommentsByFile || []
       }));
+
+      setStatusMessage('Comments loaded.');
     } catch (error) {
       console.error('Error loading comments:', error);
+      setStatusMessage('Could not load comments.');
+    } finally {
+      setLoadingCommentsFileId('');
     }
   };
 
   const addComment = async (fileId) => {
     try {
       const content = commentInputs[fileId];
-      if (!content || !user) return;
+      if (!content || !user) {
+        setStatusMessage('Please enter a comment first.');
+        return;
+      }
+
+      setAddingCommentFileId(fileId);
+      setStatusMessage('Adding comment...');
 
       await client.graphql({
         query: createCommentMutation,
@@ -269,9 +346,13 @@ function MainApp() {
         [fileId]: ''
       }));
 
-      loadComments(fileId);
+      await loadComments(fileId);
+      setStatusMessage('Comment added successfully.');
     } catch (error) {
       console.error('Error creating comment:', error);
+      setStatusMessage('Could not add comment.');
+    } finally {
+      setAddingCommentFileId('');
     }
   };
 
@@ -283,19 +364,37 @@ function MainApp() {
   };
 
   return (
-    <div style={{ maxWidth: '900px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h1>Serverless File Sharing Platform</h1>
+    <div style={{ maxWidth: '950px', margin: '0 auto', padding: '24px', fontFamily: 'Arial, sans-serif' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+        <h1 style={{ margin: 0 }}>Serverless File Sharing Platform</h1>
         <button onClick={signOut} style={{ padding: '8px 14px' }}>
           Sign Out
         </button>
       </div>
 
+      {statusMessage && (
+        <div
+          style={{
+            marginBottom: '16px',
+            padding: '10px 12px',
+            background: '#f7f7f7',
+            border: '1px solid #ddd',
+            borderRadius: '8px'
+          }}
+        >
+          {statusMessage}
+        </div>
+      )}
+
       <div style={{ border: '1px solid #ddd', borderRadius: '10px', padding: '16px', marginBottom: '16px' }}>
         <h2>Upload File</h2>
         <input type="file" onChange={(e) => setSelectedFile(e.target.files[0])} />
-        <button onClick={uploadFile} style={{ marginLeft: '10px', padding: '8px 14px' }}>
-          Upload
+        <button
+          onClick={uploadFile}
+          disabled={uploading}
+          style={{ marginLeft: '10px', padding: '8px 14px' }}
+        >
+          {uploading ? 'Uploading...' : 'Upload'}
         </button>
       </div>
 
@@ -311,8 +410,9 @@ function MainApp() {
               style={{
                 border: '1px solid #ccc',
                 borderRadius: '8px',
-                padding: '12px',
-                marginBottom: '12px'
+                padding: '14px',
+                marginBottom: '14px',
+                background: '#fff'
               }}
             >
               <p><strong>Name:</strong> {file.fileName}</p>
@@ -321,19 +421,29 @@ function MainApp() {
               <p><strong>Type:</strong> {file.fileType}</p>
               <p><strong>Size:</strong> {file.fileSize}</p>
 
-              <div style={{ marginBottom: '10px' }}>
+              <div style={{ marginBottom: '12px', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
                 <button
                   onClick={() => downloadFile(file.s3Key)}
-                  style={{ marginRight: '10px', padding: '6px 12px' }}
+                  disabled={downloadingKey === file.s3Key}
+                  style={{ padding: '6px 12px' }}
                 >
-                  Download
+                  {downloadingKey === file.s3Key ? 'Downloading...' : 'Download'}
                 </button>
 
                 <button
                   onClick={() => loadComments(file.fileId)}
+                  disabled={loadingCommentsFileId === file.fileId}
                   style={{ padding: '6px 12px' }}
                 >
-                  Load Comments
+                  {loadingCommentsFileId === file.fileId ? 'Loading...' : 'Load Comments'}
+                </button>
+
+                <button
+                  onClick={() => deleteFile(file.fileId, file.s3Key, file.fileName)}
+                  disabled={deletingFileId === file.fileId}
+                  style={{ padding: '6px 12px' }}
+                >
+                  {deletingFileId === file.fileId ? 'Deleting...' : 'Delete'}
                 </button>
               </div>
 
@@ -348,13 +458,14 @@ function MainApp() {
                       [file.fileId]: e.target.value
                     }))
                   }
-                  style={{ padding: '8px', width: '70%', maxWidth: '400px' }}
+                  style={{ padding: '8px', width: '70%', maxWidth: '420px' }}
                 />
                 <button
                   onClick={() => addComment(file.fileId)}
+                  disabled={addingCommentFileId === file.fileId}
                   style={{ marginLeft: '10px', padding: '8px 12px' }}
                 >
-                  Add Comment
+                  {addingCommentFileId === file.fileId ? 'Adding...' : 'Add Comment'}
                 </button>
               </div>
 
