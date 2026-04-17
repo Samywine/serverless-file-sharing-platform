@@ -1,8 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Authenticator, useAuthenticator } from '@aws-amplify/ui-react';
 import { generateClient } from 'aws-amplify/api';
-import { getCurrentUser, fetchUserAttributes } from 'aws-amplify/auth';
+import { getCurrentUser, fetchUserAttributes } from '@aws-amplify/auth';
 import { v4 as uuidv4 } from 'uuid';
+
+const ADMIN_EMAILS = ['samywine2@gmail.com'];
 
 const getUploadUrlMutation = `
 mutation GetUploadUrl($fileName: String!, $fileType: String!) {
@@ -66,6 +68,33 @@ mutation CreateFile(
 }
 `;
 
+const shareFileMutation = `
+mutation ShareFile(
+  $shareId: ID!,
+  $fileId: ID!,
+  $owner: String!,
+  $sharedWithUser: String!,
+  $permission: String,
+  $createdAt: AWSDateTime
+) {
+  shareFile(
+    shareId: $shareId,
+    fileId: $fileId,
+    owner: $owner,
+    sharedWithUser: $sharedWithUser,
+    permission: $permission,
+    createdAt: $createdAt
+  ) {
+    shareId
+    fileId
+    owner
+    sharedWithUser
+    permission
+    createdAt
+  }
+}
+`;
+
 const listFilesQuery = `
 query ListFiles {
   listFiles {
@@ -79,6 +108,19 @@ query ListFiles {
     sharedWith
     createdAt
     updatedAt
+  }
+}
+`;
+
+const listSharesQuery = `
+query ListShares($fileId: ID!) {
+  listShares(fileId: $fileId) {
+    shareId
+    fileId
+    owner
+    sharedWithUser
+    permission
+    createdAt
   }
 }
 `;
@@ -129,22 +171,25 @@ function MainApp() {
   const [files, setFiles] = useState([]);
   const [comments, setComments] = useState({});
   const [commentInputs, setCommentInputs] = useState({});
+  const [shareInputs, setShareInputs] = useState({});
+  const [sharePermissions, setSharePermissions] = useState({});
+  const [sharesByFile, setSharesByFile] = useState({});
   const [statusMessage, setStatusMessage] = useState('');
   const [uploading, setUploading] = useState(false);
   const [downloadingKey, setDownloadingKey] = useState('');
   const [deletingFileId, setDeletingFileId] = useState('');
   const [loadingCommentsFileId, setLoadingCommentsFileId] = useState('');
   const [addingCommentFileId, setAddingCommentFileId] = useState('');
+  const [sharingFileId, setSharingFileId] = useState('');
+  const [loadingSharesFileId, setLoadingSharesFileId] = useState('');
+
+  const isAdmin = useMemo(() => {
+    return ADMIN_EMAILS.includes(userEmail.toLowerCase());
+  }, [userEmail]);
 
   useEffect(() => {
     loadCurrentUser();
   }, []);
-
-  useEffect(() => {
-    if (user) {
-      loadFiles();
-    }
-  }, [user]);
 
   const loadCurrentUser = async () => {
     try {
@@ -158,18 +203,63 @@ function MainApp() {
     }
   };
 
-  const loadFiles = async () => {
+  const loadFiles = useCallback(async () => {
     try {
       const result = await client.graphql({
         query: listFilesQuery,
         authMode: 'userPool'
       });
-      setFiles(result?.data?.listFiles || []);
+
+      const allFiles = result?.data?.listFiles || [];
+
+      if (isAdmin) {
+        setFiles(allFiles);
+        return;
+      }
+
+      const visibleFiles = [];
+
+      for (const file of allFiles) {
+        const ownerMatch = file.owner === userEmail || file.owner === user?.username;
+
+        if (ownerMatch) {
+          visibleFiles.push(file);
+          continue;
+        }
+
+        try {
+          const sharesResult = await client.graphql({
+            query: listSharesQuery,
+            variables: { fileId: file.fileId },
+            authMode: 'userPool'
+          });
+
+          const shares = sharesResult?.data?.listShares || [];
+
+          const sharedWithCurrentUser = shares.some(
+            (share) => share.sharedWithUser?.toLowerCase() === userEmail.toLowerCase()
+          );
+
+          if (sharedWithCurrentUser) {
+            visibleFiles.push(file);
+          }
+        } catch (shareError) {
+          console.error(`Error checking shares for file ${file.fileId}:`, shareError);
+        }
+      }
+
+      setFiles(visibleFiles);
     } catch (error) {
       console.error('Error loading files:', error);
       setStatusMessage('Could not load files.');
     }
-  };
+  }, [client, isAdmin, userEmail, user]);
+
+  useEffect(() => {
+    if (user) {
+      loadFiles();
+    }
+  }, [user, loadFiles]);
 
   const uploadFile = async () => {
     try {
@@ -257,8 +347,23 @@ function MainApp() {
     }
   };
 
+  const canDeleteFile = (file) => {
+    if (isAdmin) return true;
+    return file.owner === userEmail || file.owner === user?.username;
+  };
+
+  const canShareFile = (file) => {
+    if (isAdmin) return true;
+    return file.owner === userEmail || file.owner === user?.username;
+  };
+
   const deleteFile = async (fileId, s3Key, fileName) => {
     try {
+      if (!canDeleteFile({ fileId, s3Key, fileName, owner: files.find((f) => f.fileId === fileId)?.owner })) {
+        setStatusMessage('You are not allowed to delete this file.');
+        return;
+      }
+
       const confirmed = window.confirm(`Delete "${fileName}" and all related comments/shares?`);
       if (!confirmed) return;
 
@@ -278,6 +383,12 @@ function MainApp() {
       });
 
       setCommentInputs((prev) => {
+        const updated = { ...prev };
+        delete updated[fileId];
+        return updated;
+      });
+
+      setSharesByFile((prev) => {
         const updated = { ...prev };
         delete updated[fileId];
         return updated;
@@ -315,6 +426,99 @@ function MainApp() {
       setStatusMessage('Could not load comments.');
     } finally {
       setLoadingCommentsFileId('');
+    }
+  };
+
+  const loadShares = async (fileId) => {
+    try {
+      setLoadingSharesFileId(fileId);
+      setStatusMessage('Loading shares...');
+
+      const result = await client.graphql({
+        query: listSharesQuery,
+        variables: { fileId },
+        authMode: 'userPool'
+      });
+
+      setSharesByFile((prev) => ({
+        ...prev,
+        [fileId]: result?.data?.listShares || []
+      }));
+
+      setStatusMessage('Shares loaded.');
+    } catch (error) {
+      console.error('Error loading shares:', error);
+      setStatusMessage('Could not load shares.');
+    } finally {
+      setLoadingSharesFileId('');
+    }
+  };
+
+  const shareFile = async (file) => {
+    try {
+      if (!canShareFile(file)) {
+        setStatusMessage('You are not allowed to share this file.');
+        return;
+      }
+
+      const targetEmail = (shareInputs[file.fileId] || '').trim().toLowerCase();
+      const permission = sharePermissions[file.fileId] || 'read';
+
+      if (!targetEmail) {
+        setStatusMessage('Please enter an email to share with.');
+        return;
+      }
+
+      if (targetEmail === userEmail.toLowerCase()) {
+        setStatusMessage('You already own this file.');
+        return;
+      }
+
+      setSharingFileId(file.fileId);
+      setStatusMessage('Sharing file...');
+
+      await client.graphql({
+        query: shareFileMutation,
+        variables: {
+          shareId: uuidv4(),
+          fileId: file.fileId,
+          owner: file.owner,
+          sharedWithUser: targetEmail,
+          permission,
+          createdAt: new Date().toISOString()
+        },
+        authMode: 'userPool'
+      });
+
+      const updatedSharedWith = Array.isArray(file.sharedWith)
+        ? Array.from(new Set([...file.sharedWith, targetEmail]))
+        : [targetEmail];
+
+      setFiles((prev) =>
+        prev.map((item) =>
+          item.fileId === file.fileId
+            ? { ...item, sharedWith: updatedSharedWith }
+            : item
+        )
+      );
+
+      setShareInputs((prev) => ({
+        ...prev,
+        [file.fileId]: ''
+      }));
+
+      setSharePermissions((prev) => ({
+        ...prev,
+        [file.fileId]: 'read'
+      }));
+
+      await loadShares(file.fileId);
+      setStatusMessage(`File shared with ${targetEmail}.`);
+    } catch (error) {
+      console.error('Error sharing file:', error);
+      setStatusMessage('Could not share file.');
+    } finally {
+      setSharingFileId('');
     }
   };
 
@@ -367,9 +571,14 @@ function MainApp() {
     <div style={{ maxWidth: '950px', margin: '0 auto', padding: '24px', fontFamily: 'Arial, sans-serif' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
         <h1 style={{ margin: 0 }}>Serverless File Sharing Platform</h1>
-        <button onClick={signOut} style={{ padding: '8px 14px' }}>
-          Sign Out
-        </button>
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+          <span style={{ fontSize: '14px', color: '#555' }}>
+            {isAdmin ? 'Admin user' : userEmail}
+          </span>
+          <button onClick={signOut} style={{ padding: '8px 14px' }}>
+            Sign Out
+          </button>
+        </div>
       </div>
 
       {statusMessage && (
@@ -439,13 +648,65 @@ function MainApp() {
                 </button>
 
                 <button
-                  onClick={() => deleteFile(file.fileId, file.s3Key, file.fileName)}
-                  disabled={deletingFileId === file.fileId}
+                  onClick={() => loadShares(file.fileId)}
+                  disabled={loadingSharesFileId === file.fileId}
                   style={{ padding: '6px 12px' }}
                 >
-                  {deletingFileId === file.fileId ? 'Deleting...' : 'Delete'}
+                  {loadingSharesFileId === file.fileId ? 'Loading Shares...' : 'Load Shares'}
                 </button>
+
+                {canDeleteFile(file) && (
+                  <button
+                    onClick={() => deleteFile(file.fileId, file.s3Key, file.fileName)}
+                    disabled={deletingFileId === file.fileId}
+                    style={{ padding: '6px 12px' }}
+                  >
+                    {deletingFileId === file.fileId ? 'Deleting...' : 'Delete'}
+                  </button>
+                )}
               </div>
+
+              {canShareFile(file) && (
+                <div style={{ marginBottom: '12px', padding: '10px', background: '#fafafa', borderRadius: '8px' }}>
+                  <strong>Share file</strong>
+                  <div style={{ marginTop: '8px', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                    <input
+                      type="email"
+                      placeholder="Enter email address"
+                      value={shareInputs[file.fileId] || ''}
+                      onChange={(e) =>
+                        setShareInputs((prev) => ({
+                          ...prev,
+                          [file.fileId]: e.target.value
+                        }))
+                      }
+                      style={{ padding: '8px', width: '260px' }}
+                    />
+
+                    <select
+                      value={sharePermissions[file.fileId] || 'read'}
+                      onChange={(e) =>
+                        setSharePermissions((prev) => ({
+                          ...prev,
+                          [file.fileId]: e.target.value
+                        }))
+                      }
+                      style={{ padding: '8px' }}
+                    >
+                      <option value="read">Read</option>
+                      <option value="write">Write</option>
+                    </select>
+
+                    <button
+                      onClick={() => shareFile(file)}
+                      disabled={sharingFileId === file.fileId}
+                      style={{ padding: '8px 12px' }}
+                    >
+                      {sharingFileId === file.fileId ? 'Sharing...' : 'Share'}
+                    </button>
+                  </div>
+                </div>
+              )}
 
               <div style={{ marginBottom: '10px' }}>
                 <input
@@ -469,7 +730,7 @@ function MainApp() {
                 </button>
               </div>
 
-              <div style={{ background: '#f7f7f7', padding: '10px', borderRadius: '6px' }}>
+              <div style={{ background: '#f7f7f7', padding: '10px', borderRadius: '6px', marginBottom: '10px' }}>
                 <strong>Comments:</strong>
                 {(comments[file.fileId] || []).length === 0 ? (
                   <p>No comments yet</p>
@@ -477,6 +738,19 @@ function MainApp() {
                   (comments[file.fileId] || []).map((comment) => (
                     <div key={comment.commentId} style={{ marginTop: '6px' }}>
                       {displayOwner(comment.owner)}: {comment.content}
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div style={{ background: '#f7f7f7', padding: '10px', borderRadius: '6px' }}>
+                <strong>Shares:</strong>
+                {(sharesByFile[file.fileId] || []).length === 0 ? (
+                  <p>No shares loaded yet</p>
+                ) : (
+                  (sharesByFile[file.fileId] || []).map((share) => (
+                    <div key={share.shareId} style={{ marginTop: '6px' }}>
+                      {share.sharedWithUser} ({share.permission || 'read'})
                     </div>
                   ))
                 )}
